@@ -3,3 +3,4 @@ example/includes
 build
 settings.json
 *.vcxproj
+*.filters
