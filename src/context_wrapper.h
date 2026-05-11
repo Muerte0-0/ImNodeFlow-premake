@@ -2,11 +2,13 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <limits>
 
 inline static void CopyIOEvents(ImGuiContext* src, ImGuiContext* dst, ImVec2 origin, float scale)
 {
     dst->PlatformImeData = src->PlatformImeData;
     dst->IO.DeltaTime = src->IO.DeltaTime;
+
     dst->InputEventsQueue = src->InputEventsTrail;
     for (ImGuiInputEvent& e : dst->InputEventsQueue) {
         if (e.Type == ImGuiInputEventType_MousePos) {
@@ -18,38 +20,101 @@ inline static void CopyIOEvents(ImGuiContext* src, ImGuiContext* dst, ImVec2 ori
 
 inline static void AppendDrawData(ImDrawList* src, ImVec2 origin, float scale)
 {
-    // TODO optimize if vtx_start == 0 || if idx_start == 0
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const int vtx_start = dl->VtxBuffer.size();
-    const int idx_start = dl->IdxBuffer.size();
-    dl->VtxBuffer.resize(dl->VtxBuffer.size() + src->VtxBuffer.size());
-    dl->IdxBuffer.resize(dl->IdxBuffer.size() + src->IdxBuffer.size());
-    dl->CmdBuffer.reserve(dl->CmdBuffer.size() + src->CmdBuffer.size());
-    dl->_VtxWritePtr = dl->VtxBuffer.Data + vtx_start;
-    dl->_IdxWritePtr = dl->IdxBuffer.Data + idx_start;
-    const ImDrawVert* vtx_read = src->VtxBuffer.Data;
-    const ImDrawIdx* idx_read = src->IdxBuffer.Data;
-    for (int i = 0, c = src->VtxBuffer.size(); i < c; ++i) {
-        dl->_VtxWritePtr[i].uv = vtx_read[i].uv;
-        dl->_VtxWritePtr[i].col = vtx_read[i].col;
-        dl->_VtxWritePtr[i].pos = vtx_read[i].pos * scale + origin;
-    }
-    for (int i = 0, c = src->IdxBuffer.size(); i < c; ++i) {
-        dl->_IdxWritePtr[i] = idx_read[i] + vtx_start;
-    }
-    for (auto cmd : src->CmdBuffer) {
-        cmd.IdxOffset += idx_start;
-        IM_ASSERT(cmd.VtxOffset == 0);
-        cmd.ClipRect.x = cmd.ClipRect.x * scale + origin.x;
-        cmd.ClipRect.y = cmd.ClipRect.y * scale + origin.y;
-        cmd.ClipRect.z = cmd.ClipRect.z * scale + origin.x;
-        cmd.ClipRect.w = cmd.ClipRect.w * scale + origin.y;
-        dl->CmdBuffer.push_back(cmd);
+
+    // Early exit if buffers empty
+    if (src->VtxBuffer.empty() || src->CmdBuffer.empty()) {
+        return;
     }
 
-    dl->_VtxCurrentIdx += src->VtxBuffer.size();
-    dl->_VtxWritePtr = dl->VtxBuffer.Data + dl->VtxBuffer.size();
-    dl->_IdxWritePtr = dl->IdxBuffer.Data + dl->IdxBuffer.size();
+    const bool hasVtxOffset = (ImGui::GetIO().BackendFlags & ImGuiBackendFlags_RendererHasVtxOffset) != 0;
+    const unsigned int vtx_start = static_cast<unsigned int>(dl->VtxBuffer.Size);
+    const unsigned int idx_start = static_cast<unsigned int>(dl->IdxBuffer.Size);
+
+    dl->VtxBuffer.resize(dl->VtxBuffer.Size + src->VtxBuffer.Size);
+    dl->IdxBuffer.resize(dl->IdxBuffer.Size + src->IdxBuffer.Size);
+    dl->CmdBuffer.reserve(dl->CmdBuffer.Size + src->CmdBuffer.Size);
+
+    {
+        ImDrawVert*       dst_v = dl->VtxBuffer.Data + vtx_start;
+        const ImDrawVert* src_v = src->VtxBuffer.Data;
+        for (int i = 0; i < src->VtxBuffer.Size; ++i) {
+            dst_v[i].uv  = src_v[i].uv;
+            dst_v[i].col = src_v[i].col;
+            dst_v[i].pos = src_v[i].pos * scale + origin;
+        }
+    }
+    
+    ImDrawIdx* dst_idx_base = dl->IdxBuffer.Data + idx_start;
+
+    if (hasVtxOffset)
+    {
+        memcpy(dst_idx_base, src->IdxBuffer.Data, src->IdxBuffer.Size * sizeof(ImDrawIdx));
+
+        unsigned int cached_vtx_offset    = UINT_MAX;
+        unsigned int cached_seg_vtx_count = 0;
+
+        for (int ci = 0; ci < src->CmdBuffer.Size; ++ci) {
+            ImDrawCmd cmd = src->CmdBuffer[ci];
+
+            cmd.ClipRect.x = cmd.ClipRect.x * scale + origin.x;
+            cmd.ClipRect.y = cmd.ClipRect.y * scale + origin.y;
+            cmd.ClipRect.z = cmd.ClipRect.z * scale + origin.x;
+            cmd.ClipRect.w = cmd.ClipRect.w * scale + origin.y;
+
+            if (cmd.VtxOffset != cached_vtx_offset) {
+                cached_vtx_offset = cmd.VtxOffset;
+                unsigned int next_vtx_offset = static_cast<unsigned int>(src->VtxBuffer.Size);
+                for (int ni = ci + 1; ni < src->CmdBuffer.Size; ++ni) {
+                    if (src->CmdBuffer[ni].VtxOffset > cmd.VtxOffset) {
+                        next_vtx_offset = src->CmdBuffer[ni].VtxOffset;
+                        break;
+                    }
+                }
+                cached_seg_vtx_count = next_vtx_offset - cmd.VtxOffset;
+            }
+            
+            dl->_VtxCurrentIdx = cached_seg_vtx_count;
+
+            cmd.VtxOffset += vtx_start;
+            cmd.IdxOffset += idx_start;
+            dl->CmdBuffer.push_back(cmd);
+        }
+    }
+    else {
+        const ImDrawIdx* src_idx_base = src->IdxBuffer.Data;
+
+        for (auto cmd : src->CmdBuffer) { // Note: cmd is a local copy
+            IM_ASSERT(cmd.VtxOffset == 0 && "Non-zero VtxOffset in legacy path; backend flag mismatch. Should not happen.");
+            
+            cmd.ClipRect.x = cmd.ClipRect.x * scale + origin.x;
+            cmd.ClipRect.y = cmd.ClipRect.y * scale + origin.y;
+            cmd.ClipRect.z = cmd.ClipRect.z * scale + origin.x;
+            cmd.ClipRect.w = cmd.ClipRect.w * scale + origin.y;
+
+            const unsigned int base = vtx_start + cmd.VtxOffset;
+
+            IM_ASSERT(  (sizeof(ImDrawIdx) >= 4 ||
+                        base + static_cast<unsigned int>(src->VtxBuffer.Size) - 1u
+                        <= static_cast<unsigned int>(std::numeric_limits<ImDrawIdx>::max()))
+                        && "Vertex count exceeds ImDrawIdx range; enable RendererHasVtxOffset or use 32-bit indices");
+
+            const ImDrawIdx* si = src_idx_base + cmd.IdxOffset;
+            ImDrawIdx*       di = dst_idx_base  + cmd.IdxOffset;
+            for (unsigned int ii = 0; ii < cmd.ElemCount; ++ii) {
+                di[ii] = static_cast<ImDrawIdx>(si[ii] + base);
+            }
+            cmd.VtxOffset  = 0;
+            cmd.IdxOffset += idx_start;
+            dl->CmdBuffer.push_back(cmd);
+        }
+
+        // Guaranteed safe by the IM_ASSERT above.
+        dl->_VtxCurrentIdx = vtx_start + static_cast<unsigned int>(src->VtxBuffer.Size);
+    }
+
+    dl->_VtxWritePtr = dl->VtxBuffer.Data + dl->VtxBuffer.Size;
+    dl->_IdxWritePtr = dl->IdxBuffer.Data + dl->IdxBuffer.Size;
 }
 
 struct ContainedContextConfig
@@ -104,7 +169,6 @@ inline ContainedContext::~ContainedContext()
     if (m_ctx) ImGui::DestroyContext(m_ctx);
 }
 
-// Call after Begin()
 inline void ContainedContext::setFontDensity()
 {
 #if IMGUI_VERSION_NUM >= 19198
@@ -117,6 +181,7 @@ inline void ContainedContext::begin()
     ImGui::PushID(this);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, m_config.color);
     ImGui::BeginChild("view_port", m_config.size, 0, ImGuiWindowFlags_NoMove);
+    
     setFontDensity();
     ImGui::PopStyleColor();
     m_pos = ImGui::GetWindowPos();
@@ -135,9 +200,7 @@ inline void ContainedContext::begin()
     ImGui::GetIO().DisplaySize = m_size / m_scale;
     ImGui::GetIO().ConfigInputTrickleEventQueue = false;
 
-    // Copy the ImGuiBackendFlags_RendererHasTextures flag as they need to be matching.
-    // This will also copy the ImGuiBackendFlags_RendererHasVtxOffset flag which will be more optimal in case large draw calls are being made.
-    ImGui::GetIO().ConfigFlags = m_original_ctx->IO.ConfigFlags;
+    ImGui::GetIO().ConfigFlags  = m_original_ctx->IO.ConfigFlags;
     ImGui::GetIO().BackendFlags = m_original_ctx->IO.BackendFlags;
 #ifdef IMGUI_HAS_VIEWPORT
     ImGui::GetIO().ConfigFlags &= ~(ImGuiConfigFlags_ViewportsEnable | ImGuiConfigFlags_DockingEnable);
@@ -152,6 +215,7 @@ inline void ContainedContext::begin()
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("viewport_container", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove
                                                 | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
     setFontDensity();
     ImGui::PopStyleVar();
 }
@@ -175,6 +239,12 @@ inline void ContainedContext::end()
     ImGui::SetCurrentContext(m_original_ctx);
     m_original_ctx = nullptr;
 
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->VtxBuffer.reserve(dl->VtxBuffer.Size + draw_data->TotalVtxCount);
+        dl->IdxBuffer.reserve(dl->IdxBuffer.Size + draw_data->TotalIdxCount);
+    }
+
     for (int i = 0; i < draw_data->CmdListsCount; ++i)
         AppendDrawData(draw_data->CmdLists[i], m_origin, m_scale);
 
@@ -193,7 +263,8 @@ inline void ContainedContext::end()
             m_scale = m_scaleTarget;
         }
     }
-    if (abs(m_scaleTarget - m_scale) >= 0.015f / m_config.zoom_smoothness)
+    if (m_config.zoom_smoothness > 0.f &&
+        abs(m_scaleTarget - m_scale) >= 0.015f / m_config.zoom_smoothness)
     {
         float cs = (m_scaleTarget - m_scale) / m_config.zoom_smoothness;
         m_scroll += (ImGui::GetMousePos() - m_pos) / (m_scale + cs) - (ImGui::GetMousePos() - m_pos) / m_scale;
@@ -206,15 +277,14 @@ inline void ContainedContext::end()
         }
     }
 
-    // Zoom reset
     if (ImGui::IsKeyPressed(m_config.reset_zoom_key, false))
         m_scaleTarget = m_config.default_zoom;
 
-    // Scrolling
     if (m_hovered && !m_anyItemActive && ImGui::IsMouseDragging(m_config.scroll_button, 0.f))
     {
         m_scroll += ImGui::GetIO().MouseDelta / m_scale;
     }
+
     this->m_ctx->IO.MousePos = (ImGui::GetMousePos() - m_origin) / m_scale;
     ImGui::EndChild();
     ImGui::PopID();
